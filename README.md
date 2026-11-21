@@ -5,7 +5,7 @@ connects through it in one click — built on top of
 [`vernette/warpscout`](https://github.com/vernette/warpscout)'s scanning engine
 with an embedded Clash (mihomo) core for actual traffic routing.
 
-**Download:** [latest release](https://github.com/hezhanleiok/xehn/releases/latest)
+**Download:** [latest release](https://github.com/geilige/xehn/releases/latest)
 — unzip the portable package anywhere writable and double-click
 `xehn.exe`. The package carries no account: the first connect registers
 a fresh WARP device for that machine.

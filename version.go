@@ -18,7 +18,7 @@ import (
 // the releases, the issue tracker, the notices and the licence — points here,
 // so no card ever sends the user hunting through a local folder.
 const (
-	repoOwner = "hezhanleiok"
+	repoOwner = "geilige"
 	repoName  = "xehn"
 	repoURL   = "https://github.com/" + repoOwner + "/" + repoName
 
