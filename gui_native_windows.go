@@ -691,6 +691,7 @@ func (u *natUI) sync(f func()) {
 
 func (u *natUI) invalidate() {
 	if u.cw != nil {
+		notePaintRequest()
 		_ = u.cw.Invalidate()
 	}
 }
@@ -2198,10 +2199,9 @@ func (u *natUI) onWheel(x, y int, b walk.MouseButton) {
 // ---------------------------------------------------------------------------
 
 func (u *natUI) paint(c *walk.Canvas, _ walk.Rectangle) (err error) {
-	// The watchdog uses this timestamp to tell "GUI thread is alive but not
-	// painting" from "message loop itself has stopped".
-	guiPaintHeartbeat.Store(time.Now().UnixNano())
-	paintStallStreak.Store(0)
+	// Count this as proof that an outstanding repaint request was served. The
+	// watchdog now judges stalls by pending requests, not by idle time.
+	markPaintExecuted()
 	// A paint bug used to end the process: the panic unwinds through walk's
 	// window procedure, and a windowsgui binary simply disappears with the log
 	// saying nothing. One frame is not worth losing the session over.

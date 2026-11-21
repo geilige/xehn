@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/lxn/walk"
 	"github.com/lxn/win"
 )
 
@@ -52,6 +51,15 @@ var (
 	lastPanicEvent   atomic.Int64
 	lastPanicCount   atomic.Int64
 	paintStallStreak atomic.Int64
+	nextPaintCheck   atomic.Int64
+
+	// R010: a still window is not a stalled window. Requests are counted when
+	// the GUI asks for a repaint; a paint serves all requests outstanding at
+	// the time it runs (Windows coalesces WM_PAINT).
+	invalidateRequests    atomic.Uint64
+	paintExecutions       atomic.Uint64
+	lastServedRequest     atomic.Uint64
+	lastInvalidateRequest atomic.Int64
 
 	// Injectable seam for the watchdog regression test. Production uses the
 	// real GUI post and the real forced repaint below.
@@ -59,59 +67,107 @@ var (
 	paintRescue = forcePaintRepaint
 )
 
-// paintRescueModeResetNeeded is true for the default double-buffer mode, so
-// the level-2 rescue also runs when BufferedPaint is on (R007).
-func paintRescueModeResetNeeded(mode walk.PaintMode) bool {
-	return mode == walk.PaintBuffered
+func notePaintRequest() {
+	invalidateRequests.Add(1)
+	lastInvalidateRequest.Store(time.Now().UnixNano())
 }
 
-// forcePaintRepaint is called on the GUI thread. It goes beyond Invalidate():
-// RedrawWindow(UPDATENOW) forces WM_PAINT delivery, and on a repeated stall a
-// frame-change SetWindowPos plus a PaintMode toggle resets the buffered-paint
-// state that can leave the custom widget permanently blank.
-func forcePaintRepaint(u *natUI, level int) bool {
-	if u.cw == nil {
+// markPaintExecuted is called from the real paint callback and from tests that
+// simulate one. Storing the current request count (rather than just adding 1)
+// handles Windows coalescing several Invalidate calls into a single WM_PAINT.
+func markPaintExecuted() {
+	paintExecutions.Add(1)
+	lastServedRequest.Store(invalidateRequests.Load())
+	guiPaintHeartbeat.Store(time.Now().UnixNano())
+	paintStallStreak.Store(0)
+}
+
+// isTruePaintStall separates "nobody asked to repaint" from "a repaint was
+// requested and never happened". Only the latter is a stall; a quiet session
+// is the normal state and must never be logged as one.
+func isTruePaintStall(requests, served uint64, lastRequest int64, now time.Time) bool {
+	if lastRequest == 0 || requests <= served {
 		return false
 	}
-	hwnd := u.cw.Handle()
-	ok := win.RedrawWindow(hwnd, nil, 0, win.RDW_INVALIDATE|win.RDW_UPDATENOW|win.RDW_ERASE)
-	_ = u.cw.Invalidate()
-	if level >= 2 {
-		win.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
-			win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE|win.SWP_FRAMECHANGED)
-		if paintRescueModeResetNeeded(u.cw.PaintMode()) {
-			// Reset the double-buffer state without changing the configured
-			// default: toggle away and back while a frame is being forced.
-			u.cw.SetPaintMode(walk.PaintNormal)
-			u.cw.SetPaintMode(walk.PaintBuffered)
-		}
-	}
-	return ok
+	return now.Sub(time.Unix(0, lastRequest)) > paintHeartbeatStall
 }
 
-// handlePaintStall escalates from a normal redraw to a window-position reset
-// and reports whether the GUI callback actually ran. It never blocks the
-// watchdog for more than two seconds.
-func handlePaintStall(u *natUI, age time.Duration) bool {
-	streak := paintStallStreak.Add(1)
+// stallBackoff grows the check interval after repeated ineffective rescues:
+// 3s, 12s, then 60s. Without it a permanently failing repaint logged a pair
+// of lines every few seconds for hours.
+func stallBackoff(streak int64) time.Duration {
+	switch {
+	case streak <= 1:
+		return 3 * time.Second
+	case streak <= 3:
+		return 12 * time.Second
+	default:
+		return 60 * time.Second
+	}
+}
+
+// logPaintEvent throttles the stall/rescue pair inside one long streak while
+// keeping the counters in the diagnostic summary exact.
+func logPaintEvent(streak int64) bool {
+	return streak <= 3 || streak%10 == 0
+}
+
+// forcePaintRepaint is called on the GUI thread. It asks Windows to deliver a
+// paint now; success is NOT concluded from the API return value — only a real
+// paint execution counts. The PaintMode toggle was removed: it never helped
+// and could itself stop walk from calling paint again (R010).
+func forcePaintRepaint(u *natUI, level int) {
+	if u.cw == nil {
+		return
+	}
+	notePaintRequest()
+	hwnd := u.cw.Handle()
+	_ = win.RedrawWindow(hwnd, nil, 0, win.RDW_INVALIDATE|win.RDW_UPDATENOW|win.RDW_ERASE)
+	_ = u.cw.Invalidate()
+	if level >= 2 {
+		// Force a window-position notification so walk re-evaluates the whole
+		// client area. This does not touch the configured paint mode.
+		win.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+			win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOZORDER|win.SWP_NOACTIVATE|win.SWP_FRAMECHANGED)
+	}
+}
+
+// handlePaintStall posts one rescue and proves it by observing a real paint
+// execution within a bounded window. A RedrawWindow return value is not proof.
+func handlePaintStall(u *natUI, age time.Duration, streak int64) bool {
 	level := 1
 	if streak >= 2 {
 		level = 2
 	}
-	done := make(chan bool, 1)
-	postToGUI(u, func() { done <- paintRescue(u, level) })
+	baseline := paintExecutions.Load()
+	posted := make(chan struct{})
+	postToGUI(u, func() {
+		paintRescue(u, level)
+		close(posted)
+	})
 	select {
-	case ok := <-done:
-		if ok {
-			u.diagEvent("绘制停摆补救成功：层级 %d（停摆 %.0fs，连续 %d 次）", level, age.Seconds(), streak)
-		} else {
-			u.diagEvent("绘制停摆补救失败：层级 %d（停摆 %.0fs）", level, age.Seconds())
-		}
-		return ok
+	case <-posted:
 	case <-time.After(2 * time.Second):
-		u.diagEvent("绘制停摆补救未执行：GUI 线程 2s 内未响应")
+		if logPaintEvent(streak) {
+			u.diagEvent("绘制停摆补救未执行：GUI 线程 2s 内未响应")
+		}
 		return false
 	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if paintExecutions.Load() > baseline {
+			if logPaintEvent(streak) {
+				u.diagEvent("绘制停摆补救成功（paint 已执行）：层级 %d（停摆 %.0fs，连续 %d 次）", level, age.Seconds(), streak)
+			}
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if logPaintEvent(streak) {
+		u.diagEvent("绘制停摆补救未生效（paint 未执行）：层级 %d（停摆 %.0fs，连续 %d 次）", level, age.Seconds(), streak)
+	}
+	return false
 }
 
 // atomicProgress is the non-blocking bridge from the connect worker to the
@@ -255,7 +311,9 @@ func (u *natUI) diagnosticSummary() string {
 	fmt.Fprintf(&b, "sync: posts=%d max=%s callbacks=%d max=%s slow_posts=%d slow_callbacks=%d\r\n",
 		syncPosts.Load(), time.Duration(syncPostMaxNS.Load()), syncCallbacks.Load(), time.Duration(syncCallbackMax.Load()),
 		syncSlowPosts.Load(), syncSlowCBs.Load())
-	fmt.Fprintf(&b, "paint panics: %d\r\n", count)
+	fmt.Fprintf(&b, "paint: requests=%d executions=%d pending=%d stall_streak=%d panics=%d\r\n",
+		invalidateRequests.Load(), paintExecutions.Load(),
+		invalidateRequests.Load()-lastServedRequest.Load(), paintStallStreak.Load(), count)
 	for _, d := range details {
 		b.WriteString("  " + d + "\r\n")
 	}
@@ -305,10 +363,23 @@ func (u *natUI) watchdogLoop() {
 			lastGUIEvent.Store(now.UnixNano())
 			u.diagEvent("GUI 消息循环停摆：Synchronize 心跳 %.0fs 未执行", msgAge.Seconds())
 		}
-		if msgAge <= guiHeartbeatStall && paintAge > paintHeartbeatStall && time.Since(time.Unix(0, lastPaintEvent.Load())) > diagEventGap {
-			lastPaintEvent.Store(now.UnixNano())
-			u.diagEvent("绘制停摆：消息循环仍在，但 %.0fs 未绘制", paintAge.Seconds())
-			handlePaintStall(u, paintAge)
+		requests, served := invalidateRequests.Load(), lastServedRequest.Load()
+		if requests <= served {
+			// No outstanding repaint: a quiet window is healthy, not stalled.
+			paintStallStreak.Store(0)
+			nextPaintCheck.Store(0)
+		}
+		if msgAge <= guiHeartbeatStall &&
+			isTruePaintStall(requests, served, lastInvalidateRequest.Load(), now) &&
+			now.UnixNano() >= nextPaintCheck.Load() {
+			streak := paintStallStreak.Add(1)
+			nextPaintCheck.Store(now.Add(stallBackoff(streak)).UnixNano())
+			if logPaintEvent(streak) && time.Since(time.Unix(0, lastPaintEvent.Load())) > diagEventGap {
+				lastPaintEvent.Store(now.UnixNano())
+				u.diagEvent("绘制请求未响应：有 %d 个未决重绘，%.0fs 无 paint（连续 %d 次）",
+					requests-served, paintAge.Seconds(), streak)
+			}
+			handlePaintStall(u, paintAge, streak)
 		}
 		if workerAge > workerHeartbeatStall && time.Since(time.Unix(0, lastWorkerEvent.Load())) > diagEventGap {
 			lastWorkerEvent.Store(now.UnixNano())

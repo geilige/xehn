@@ -493,6 +493,10 @@ var enFormats = map[string]string{
 	"GUI 回调耗时过长：%s %s":                  "Slow GUI callback: %s %s",
 	"本轮时间上限，已尝试 %d/%d 组（%d 秒）":          "Round time limit reached, tried %d/%d combinations (%ds)",
 	"连续 %d 次探测失败，进行加长复核（%s）…":           "%d consecutive probe failures, running extended reconfirmation (%s)…",
+	"绘制请求未响应：有 %d 个未决重绘，%.0fs 无 paint（连续 %d 次）":    "Paint request unanswered: %d pending repaints, no paint for %.0fs (streak %d)",
+	"绘制停摆补救成功（paint 已执行）：层级 %d（停摆 %.0fs，连续 %d 次）":  "Paint stall rescue succeeded (paint ran): level %d (stalled %.0fs, streak %d)",
+	"绘制停摆补救未生效（paint 未执行）：层级 %d（停摆 %.0fs，连续 %d 次）": "Paint stall rescue ineffective (paint did not run): level %d (stalled %.0fs, streak %d)",
+	"绘制停摆补救未执行：GUI 线程 2s 内未响应":                     "Paint stall rescue not delivered: GUI thread did not respond in 2s",
 }
 
 // tr translates a UI string. Chinese is the source language, so zh needs no
