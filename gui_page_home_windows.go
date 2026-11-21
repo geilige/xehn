@@ -110,9 +110,16 @@ func (u *natUI) paintConnectButton(c *walk.Canvas, cx, cy float64) {
 			u.circleFill(c, col, cx-dotGap+float64(i)*dotGap, cy-14, 3.4+1.4*t)
 		}
 
-		label := tr("连接中…")
+		stage, attempt, total := u.progress.get()
+		label := stageText(stage)
+		if label == "" {
+			label = tr("连接中…")
+		}
 		if u.m.connecting && !u.m.cancelling && !u.m.connectAt.IsZero() {
-			label = trf("连接中… %ds", int(time.Since(u.m.connectAt).Seconds()))
+			label = trf("%s %ds", label, int(time.Since(u.m.connectAt).Seconds()))
+		}
+		if u.m.connecting && attempt > 0 && total > 0 {
+			label = trf("%s · %s", label, trf("组合 %d/%d", attempt, total))
 		}
 		if u.m.working && !u.m.connecting {
 			label = tr("断开中…")
@@ -122,7 +129,7 @@ func (u *natUI) paintConnectButton(c *walk.Canvas, cx, cy float64) {
 			// the seconds keep counting and the cancel looks ignored.
 			label = tr("正在取消…")
 		}
-		u.textC(c, label, u.f.f13b, th.dim, u.r(cx-110, cy+16, 220, 24))
+		u.textC(c, label, u.f.f12b, th.dim, u.r(cx-118, cy+16, 236, 24))
 	case connected:
 		// White on the success fill: the glyph and the word have to stay legible
 		// against a colour instead of the frosted glass they were drawn for.

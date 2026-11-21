@@ -83,8 +83,8 @@ type clientSettings struct {
 	// OpenVPN is the V2 egress switch: a VPN Gate relay dialled from inside the
 	// base protocol. Mutually exclusive with Psiphon — both replace the final
 	// exit, and a session can only land in one place.
-	OpenVPN    bool   `json:"openvpn"`
-	AutoRepair bool   `json:"auto_repair"`
+	OpenVPN    bool `json:"openvpn"`
+	AutoRepair bool `json:"auto_repair"`
 	// PsiphonRegion is the preferred Psiphon exit country (ISO alpha-2, upper
 	// case). Empty means "automatic" — Psiphon picks the region itself.
 	PsiphonRegion string `json:"psiphon_region"`
@@ -94,15 +94,29 @@ type clientSettings struct {
 	// OpenVPNNode pins one relay inside that country (country-ip-port, the same
 	// id the picker shows). Empty means "auto": the connect picks by latency.
 	OpenVPNNode string `json:"openvpn_node"`
+	// OpenVPNAttempts caps base-endpoint × relay combinations for one connect.
+	// Zero keeps the built-in default (6); the GUI clamps it to 1-12.
+	OpenVPNAttempts int `json:"openvpn_attempts"`
+	// Diagnostics enables verbose heartbeat/Synchronize logging for hang
+	// investigations. The watchdog itself always runs at low overhead.
+	Diagnostics bool `json:"diagnostics"`
+	// BufferedPaint selects walk's double-buffer mode. Default on: the full
+	// window repaints every frame, so PaintNormal visibly flickers. R006's
+	// watchdog remains the backstop for a stalled buffer.
+	BufferedPaint bool `json:"buffered_paint"`
+	// PaintModeV2 marks that buffered_paint was written by a version that
+	// distinguishes an explicit user choice from R006's old default of false.
+	// Internal migration marker; no UI surface.
+	PaintModeV2 bool `json:"paint_mode_v2,omitempty"`
 	// Pin is the endpoint the user picked as the default node; empty means the
 	// fastest cached endpoint wins.
 	Pin string `json:"pin"`
 
 	// Local proxy: where clients point, where the core's API listens, and
 	// whether other devices on the LAN may use the mixed port.
-	MixedPort   int  `json:"mixed_port"`
-	APIPort     int  `json:"api_port"`
-	AllowLan    bool `json:"allow_lan"`
+	MixedPort   int    `json:"mixed_port"`
+	APIPort     int    `json:"api_port"`
+	AllowLan    bool   `json:"allow_lan"`
 	CaptureMode string `json:"capture_mode"`
 
 	// Network. IPFamily is the tunnel's address family (v4/v6/both); it is
@@ -159,19 +173,22 @@ const settingsName = "settings.json"
 
 func defaultSettings() clientSettings {
 	return clientSettings{
-		Theme:        themeLight,
-		Lang:         langZH,
-		Proto:        protoAWG,
-		OuterProto:   protoWG,
-		InnerProto:   protoWG,
-		AutoRepair:   true,
-		MixedPort:    core.DefaultMixedPort,
-		APIPort:      core.DefaultAPIPort,
-		CaptureMode:  captureProxy,
-		IPFamily:     famV4,
-		TimeoutSec:   2,
-		DNSLeak:      true,
-		ProxyMode:    modeCustom,
+		Theme:           themeLight,
+		Lang:            langZH,
+		Proto:           protoAWG,
+		OuterProto:      protoWG,
+		InnerProto:      protoWG,
+		AutoRepair:      true,
+		MixedPort:       core.DefaultMixedPort,
+		APIPort:         core.DefaultAPIPort,
+		CaptureMode:     captureProxy,
+		IPFamily:        famV4,
+		TimeoutSec:      2,
+		OpenVPNAttempts: openvpnMaxAttempts,
+		BufferedPaint:   true,
+		PaintModeV2:     true,
+		DNSLeak:         true,
+		ProxyMode:       modeCustom,
 	}
 }
 
@@ -211,7 +228,19 @@ func loadSettings() clientSettings {
 		if _, ok := keys["ip_family"]; !ok && s.IPv6 != nil && *s.IPv6 {
 			s.IPFamily = famV6
 		}
+		if _, ok := keys["buffered_paint"]; !ok {
+			// R006-era file: the key did not exist, so the old single-buffer
+			// default must not win over the new no-flicker default.
+			s.BufferedPaint = true
+		} else if _, marked := keys["paint_mode_v2"]; !marked && !s.BufferedPaint {
+			// R006 wrote an explicit false because that was its default; no
+			// UI ever let the user choose it. Treat that one value as legacy
+			// too. Once this file is saved the marker makes later explicit
+			// false values stick.
+			s.BufferedPaint = true
+		}
 	}
+	s.PaintModeV2 = true
 	// The old rule mode plus the geo switch is today's bypass preset; plain
 	// rule mode becomes custom (normalize handles that mapping).
 	var legacy struct {
@@ -343,6 +372,9 @@ func (s *clientSettings) normalize() {
 		s.OpenVPNRegion = ""
 	}
 	s.OpenVPNNode = strings.TrimSpace(s.OpenVPNNode)
+	if s.OpenVPNAttempts <= 0 || s.OpenVPNAttempts > 12 {
+		s.OpenVPNAttempts = openvpnMaxAttempts
+	}
 	// The control code is compared against a hand-written list, so it is kept
 	// in one spelling: upper case, four-character groups, nothing else.
 	if s.ControlCode != "" {
@@ -452,4 +484,5 @@ func (s clientSettings) apply(o *options) {
 	o.psiphonRegion = s.PsiphonRegion
 	o.openvpnRegion = s.OpenVPNRegion
 	o.openvpnNodePin = s.OpenVPNNode
+	o.openvpnAttempts = s.OpenVPNAttempts
 }

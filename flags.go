@@ -126,6 +126,10 @@ type options struct {
 	// repair leaves it off — a repair must restore the session, not shop for a
 	// faster relay — while every interactive connect turns it on.
 	openvpnSpeedGate bool
+	// openvpnAttempts caps base-endpoint × relay combinations in one connect.
+	// Zero means the default (openvpnMaxAttempts), so CLI callers and older
+	// settings files keep the existing behaviour.
+	openvpnAttempts int
 	// openvpnAcceptSlow is set by the connect loop once the speed-retry budget
 	// is spent, so the next working relay is kept even if it is still slow:
 	// slow beats nothing.
@@ -273,6 +277,7 @@ var (
 		{"", "psiphon-exe", "PATH", "path to the Psiphon executable (else PSIPHON_EXE env or <coreDir>/psiphon.exe)"},
 		{"", "openvpn", "", "OpenVPN exit (V2): chain a VPN Gate relay behind the base protocol (IPv4 only; wins over --psiphon)"},
 		{"", "openvpn-region", "ISO", "preferred VPN Gate exit country (ISO alpha-2, empty = fastest reachable node)"},
+		{"", "openvpn-attempts", "N", "max OpenVPN base-endpoint × relay combinations per connect (default 6, max 12)"},
 		{"", "top", "N", "reserved: number of top endpoints to keep in the cache"},
 	}}
 
@@ -475,6 +480,7 @@ func setupConnectFlags(fs *flag.FlagSet, o *options) {
 	fs.StringVar(&o.psiphonExe, "psiphon-exe", "", "")
 	fs.BoolVar(&o.openvpnMode, "openvpn", false, "")
 	fs.StringVar(&o.openvpnRegion, "openvpn-region", "", "")
+	fs.IntVar(&o.openvpnAttempts, "openvpn-attempts", 0, "")
 	o.wantMeta = true
 }
 

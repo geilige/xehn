@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -31,7 +32,46 @@ const (
 	ConfigName       = "config.yaml"
 	geoSiteName      = "geosite.dat"
 	geoIPName        = "geoip.dat"
+	// tunAdapterWait bounds how long a core start/stop waits for wintun to
+	// release its adapter. It is deliberately short: the connect path has a
+	// hard 90s budget and a stuck adapter should skip a combination, not hang.
+	tunAdapterWait = 2 * time.Second
 )
+
+// tunReleaseMu serialises TUN adapter creation/removal process-wide. mihomo
+// removes its wintun device asynchronously after the child exits; without the
+// lock two rapid retries overlap and the second "creates" an adapter that is
+// still being torn down ("Cannot create a file when that file already exists").
+var tunReleaseMu sync.Mutex
+
+// WaitTUNReleased reports when no mihomo/wintun adapter is present. The match
+// is intentionally broad: mihomo's device name varies slightly across builds,
+// and a false "still busy" only costs the short timeout below.
+func WaitTUNReleased(timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = tunAdapterWait
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		busy := false
+		if ifs, err := net.Interfaces(); err == nil {
+			for _, in := range ifs {
+				name := strings.ToLower(in.Name)
+				if strings.Contains(name, "mihomo") || strings.Contains(name, "wintun") {
+					busy = true
+					break
+				}
+			}
+		}
+		if !busy {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("TUN adapter still present after %s", timeout)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
 
 // Config drives a Core.
 type Config struct {
@@ -166,6 +206,13 @@ func (c *Core) Start() error {
 	if err := os.MkdirAll(c.cfg.WorkDir, 0o755); err != nil {
 		return fmt.Errorf("core: workdir: %w", err)
 	}
+	if c.cfg.TUN {
+		tunReleaseMu.Lock()
+		defer tunReleaseMu.Unlock()
+		if err := WaitTUNReleased(tunAdapterWait); err != nil {
+			return fmt.Errorf("core: tun adapter: %w", err)
+		}
+	}
 	// Nothing may be listening on the core's ports when the new process binds
 	// them. A leftover core that was killed but has not finished dying keeps
 	// 7890/9090 bound; the new mihomo then fails its bind yet does NOT exit,
@@ -275,6 +322,10 @@ func (c *Core) CrashCode() (uint32, bool) {
 
 // Stop terminates the core process and waits for it to exit.
 func (c *Core) Stop() error {
+	if c.cfg.TUN {
+		tunReleaseMu.Lock()
+		defer tunReleaseMu.Unlock()
+	}
 	c.mu.Lock()
 	cmd := c.cmd
 	cancel := c.cancel
@@ -292,6 +343,12 @@ func (c *Core) Stop() error {
 			_ = cmd.Process.Kill()
 			<-c.done
 		}
+	}
+	if c.cfg.TUN {
+		// The child has exited, but Windows can still be removing the wintun
+		// adapter. Wait here while holding tunReleaseMu so the next Start sees
+		// a clean device table.
+		_ = WaitTUNReleased(tunAdapterWait)
 	}
 	return nil
 }

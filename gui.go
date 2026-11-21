@@ -12,16 +12,17 @@ import (
 // would produce, so the GUI and the CLI share the exact same code path.
 func defaultConnectOptions(proto string, tun, scanNow bool) options {
 	o := options{
-		proto:          proto,
-		tunMode:        tun,
-		scanNow:        scanNow,
-		mixedPort:      core.DefaultMixedPort,
-		apiPort:        core.DefaultAPIPort,
-		timeoutSec:     2,
-		tunnelParallel: defaultTunnelJobs,
-		perSubnet:      1,
-		confType:       confTypeMihomo,
-		wantMeta:       true,
+		proto:           proto,
+		tunMode:         tun,
+		scanNow:         scanNow,
+		mixedPort:       core.DefaultMixedPort,
+		apiPort:         core.DefaultAPIPort,
+		timeoutSec:      2,
+		tunnelParallel:  defaultTunnelJobs,
+		perSubnet:       1,
+		confType:        confTypeMihomo,
+		wantMeta:        true,
+		openvpnAttempts: openvpnMaxAttempts,
 	}
 	if proto == "" {
 		o.proto = protoAWG

@@ -52,6 +52,44 @@ func TestJudgeHealthStreakThenRecovery(t *testing.T) {
 	}
 }
 
+// R008: the guard's third failure must be reconfirmed with a longer budget
+// before it is allowed to rotate. The pure decision is tested here so the
+// "one slow answer is not a dead exit" rule cannot regress silently.
+func TestJudgeHealthWithReconfirm(t *testing.T) {
+	first := judgeHealthWithReconfirm(0, false, false)
+	if first.fails != 1 || first.repair {
+		t.Fatalf("first failure = %+v, want fails=1 no repair", first)
+	}
+	second := judgeHealthWithReconfirm(first.fails, false, false)
+	if second.fails != 2 || second.repair {
+		t.Fatalf("second failure = %+v, want fails=2 no repair", second)
+	}
+
+	passed := judgeHealthWithReconfirm(second.fails, false, true)
+	if passed.repair || passed.fails != 0 || !passed.recovered {
+		t.Fatalf("third failure with passing reconfirm = %+v, want cleared and recovered", passed)
+	}
+	// The streak starts over: two more failures still must not rotate.
+	again := judgeHealthWithReconfirm(passed.fails, false, false)
+	if again.fails != 1 || again.repair {
+		t.Fatalf("failure after reconfirm = %+v, want a fresh count of 1", again)
+	}
+
+	failed := judgeHealthWithReconfirm(second.fails, false, false)
+	if !failed.repair || failed.fails != 0 {
+		t.Fatalf("third failure with failed reconfirm = %+v, want repair", failed)
+	}
+}
+
+func TestHealthReconfirmBudgetIsLonger(t *testing.T) {
+	if healthReconfirmBudget < 2*probeBudget {
+		t.Fatalf("reconfirm budget %s must be at least 2x normal %s", healthReconfirmBudget, probeBudget)
+	}
+	if healthReconfirmTimeout <= probeTimeout {
+		t.Fatalf("reconfirm timeout %s must exceed normal %s", healthReconfirmTimeout, probeTimeout)
+	}
+}
+
 // processAlive must not claim liveness for pids that cannot be ours: ownership
 // is decided by this answer, and a wrong "alive" keeps a session unmonitored.
 func TestProcessAliveRejectsImpossiblePids(t *testing.T) {

@@ -42,6 +42,11 @@ const (
 	// One failure can be a busy core or a transient timeout; several spread
 	// over half a minute cannot.
 	healthFailLimit = 3
+	// healthReconfirmBudget / healthReconfirmTimeout give a slow exit one
+	// longer chance before the guard calls it dead. The normal probe stays at
+	// 9s/5s; only the third-failure confirmation uses these values.
+	healthReconfirmBudget  = 20 * time.Second
+	healthReconfirmTimeout = 12 * time.Second
 	// healthOwnerFile holds the pid of whoever currently owns this session's
 	// health check and repair. Exactly one owner at a time, enforced by O_EXCL
 	// and confirmed by whether that pid still runs - see claimHealthOwner.
@@ -150,6 +155,26 @@ func lostHealthOwner(pid int) bool {
 	return alive && owner != pid
 }
 
+// healthDiagLog records a reconfirmation outcome in the same post-mortem file
+// the GUI watchdog uses. It is gated by the diagnostics setting, so a normal
+// session pays only one settings read when the guard is about to repair.
+func healthDiagLog(format string, args ...any) {
+	if !loadSettings().Diagnostics {
+		return
+	}
+	dir, err := appDir()
+	if err != nil {
+		return
+	}
+	line := time.Now().Format("2006-01-02 15:04:05.000 ") + fmt.Sprintf(format, args...) + "\r\n"
+	f, err := os.OpenFile(filepath.Join(dir, "diagnostics.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = f.WriteString(line)
+	_ = f.Close()
+}
+
 // healthResult is one check's outcome.
 type healthResult struct {
 	OK     bool
@@ -188,27 +213,50 @@ func judgeHealth(fails int, ok bool) healthVerdict {
 	return healthVerdict{fails: 0, repair: true}
 }
 
+// judgeHealthWithReconfirm is the decision the guard actually uses. The first
+// two failures behave exactly like judgeHealth. On the third, a successful
+// extended-budget reconfirmation clears the streak instead of repairing: a
+// slow VPN Gate relay answering once in 20s is still a usable exit, and a
+// rotation costs far more than the extra wait. A failed reconfirmation keeps
+// the original repair behaviour.
+func judgeHealthWithReconfirm(fails int, ok bool, reconfirmOK bool) healthVerdict {
+	if ok || fails+1 < healthFailLimit {
+		return judgeHealth(fails, ok)
+	}
+	if reconfirmOK {
+		return healthVerdict{fails: 0, recovered: true}
+	}
+	return healthVerdict{fails: 0, repair: true}
+}
+
 // checkDataPlane asks the question status used to assume the answer to: does a
 // real HTTPS request through the local mixed port complete right now? A v6-only
 // session is probed against a v6 literal, because its public sources are v4
 // hostnames that the tunnel intentionally cannot reach.
 func checkDataPlane(mixedPort int, family string) healthResult {
+	return checkDataPlaneWithBudget(mixedPort, family, probeTimeout, probeBudget)
+}
+
+// checkDataPlaneWithBudget asks the same question with a caller-supplied
+// budget. The guard's third-failure reconfirmation uses it so a slow exit gets
+// one longer answer window without changing the normal probe path.
+func checkDataPlaneWithBudget(mixedPort int, family string, timeout, budget time.Duration) healthResult {
 	if mixedPort <= 0 {
 		return healthResult{Err: fmt.Errorf("no mixed port in state")}
 	}
 	if family == famV6 {
-		ip, err := fetchV6Probe(mixedPort)
+		ip, err := fetchV6ProbeWithBudget(mixedPort, timeout)
 		if err != nil {
 			return healthResult{Err: err}
 		}
 		return healthResult{OK: true, ExitIP: ip}
 	}
-	probe, err := fetchSessionProbe(mixedPort, family)
+	probe, err := fetchSessionProbeWithBudget(mixedPort, family, timeout, budget)
 	if err != nil {
 		return healthResult{Err: err}
 	}
 	if family == famBoth {
-		if _, err := fetchV6Probe(mixedPort); err != nil {
+		if _, err := fetchV6ProbeWithBudget(mixedPort, timeout); err != nil {
 			return healthResult{Err: fmt.Errorf("IPv6: %w", err)}
 		}
 	}
@@ -798,12 +846,30 @@ func runHealthGuardCmd(ctx context.Context, opts options) error {
 			return nil
 		}
 		res := checkDataPlane(st.MixedPort, st.Family)
-		if verdict := judgeHealth(fails, res.OK); !verdict.repair {
+		// A slow public relay can miss three short 9s windows and still be
+		// usable. Before the third failure turns into a rotation, give it one
+		// extended-budget answer; only that reconfirmation may declare death.
+		reconfirmOK := false
+		if !res.OK && fails+1 >= healthFailLimit {
+			logf(fmt.Sprintf("连续 %d 次探测失败，进行加长复核（%s）…", healthFailLimit, healthReconfirmBudget))
+			healthDiagLog("health reconfirm started: budget=%s timeout=%s", healthReconfirmBudget, healthReconfirmTimeout)
+			again := checkDataPlaneWithBudget(st.MixedPort, st.Family, healthReconfirmTimeout, healthReconfirmBudget)
+			reconfirmOK = again.OK
+			if reconfirmOK {
+				logf("复核通过，出口仍可用")
+				healthDiagLog("health reconfirm passed: exit=%s", again.ExitIP)
+			} else {
+				logf("复核失败，判定出口失效: " + fmt.Sprint(again.Err))
+				healthDiagLog("health reconfirm failed: %v", again.Err)
+			}
+		}
+		verdict := judgeHealthWithReconfirm(fails, res.OK, reconfirmOK)
+		if !verdict.repair {
 			fails = verdict.fails
-			if res.OK {
+			if res.OK || reconfirmOK {
 				psiphonRestarts = 0
 				psiphonUnderlayFails = 0
-				if verdict.recovered {
+				if verdict.recovered && !reconfirmOK {
 					logf("数据面已恢复")
 				}
 				continue

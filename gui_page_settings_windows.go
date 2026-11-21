@@ -382,6 +382,8 @@ func (u *natUI) paintSetBehaviour(c *walk.Canvas, x, y, w float64) {
 		tr("会话断开后由后台守护自动重建"), s.AutoRepair, true)
 	u.rowEdit(c, x, cy+152, w, "set:timeout", tr("连接超时（秒）"),
 		itoa(int64(s.TimeoutSec)), "2")
+	u.rowToggle(c, x, cy+190, w, "set:diagnostics", tr("诊断日志"),
+		tr("记录心跳与 GUI 阻塞排查信息到 diagnostics.log"), s.Diagnostics, true)
 }
 
 // paintSetExit is the DNS and Psiphon card. Leak protection sits next to the

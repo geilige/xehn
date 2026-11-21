@@ -259,6 +259,9 @@ func (u *natUI) actionSetting(id string) {
 	case "set:autorepair":
 		toggle(func(s *clientSettings) { s.AutoRepair = !s.AutoRepair })
 		return
+	case "set:diagnostics":
+		toggle(func(s *clientSettings) { s.Diagnostics = !s.Diagnostics })
+		return
 	case "set:dnsdi":
 		toggle(func(s *clientSettings) { s.DNSOff = !s.DNSOff })
 		return
@@ -438,6 +441,7 @@ func (u *natUI) actionSetting(id string) {
 	if u.m.connected {
 		u.m.setDirty = true
 	}
+	u.refreshDiagFlag()
 	u.addLog(tr("已保存：")+label+" = "+val, false)
 	// Repaint first: the page should already show the new value when the user
 	// dismisses the confirmation.
@@ -500,6 +504,7 @@ func (u *natUI) syncSessionFromSettings() {
 	u.m.openvpn = s.OpenVPN
 	u.m.outerProto = s.OuterProto
 	u.m.innerProto = s.InnerProto
+	u.refreshDiagFlag()
 	u.invalidate()
 }
 

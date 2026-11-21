@@ -440,6 +440,7 @@ func (u *natUI) diagHeader() string {
 	if st, err := loadState(); err == nil {
 		b.WriteString("state: " + st.statusLine() + "\r\n")
 	}
+	b.WriteString(u.diagnosticSummary())
 	return b.String()
 }
 
@@ -522,6 +523,7 @@ func (u *natUI) mutateSettings(fn func(*clientSettings)) {
 	} else if u.m.connected {
 		u.m.setDirty = true
 	}
+	u.refreshDiagFlag()
 	u.invalidate()
 }
 

@@ -114,6 +114,46 @@ func TestSettingsNormalize(t *testing.T) {
 // TestSettingsLegacyMigration checks the one-time upgrade path: an old file
 // with the independent tun/system_proxy/ipv6 switches becomes a capture mode
 // and an address family, and the legacy keys are not written again.
+func TestBufferedPaintMigration(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"fresh default", `{}`, true},
+		{"old file without key", `{"proto":"awg","diagnostics":false}`, true},
+		{"R006 written false without marker", `{"buffered_paint":false}`, true},
+		{"explicit true", `{"buffered_paint":true,"paint_mode_v2":true}`, true},
+		{"explicit false after migration", `{"buffered_paint":false,"paint_mode_v2":true}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("WARP_CLIENT_HOME", dir)
+			if err := os.WriteFile(filepath.Join(dir, settingsName), []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got := loadSettings()
+			if got.BufferedPaint != tc.want {
+				t.Fatalf("BufferedPaint = %v, want %v", got.BufferedPaint, tc.want)
+			}
+			if !got.PaintModeV2 {
+				t.Fatal("migration marker was not set")
+			}
+		})
+	}
+}
+
+func TestDistSettingsMigratesToBufferedPaint(t *testing.T) {
+	if _, err := os.Stat(filepath.Join("dist", settingsName)); err != nil {
+		t.Skip("no dist/settings.json in this checkout")
+	}
+	t.Setenv("WARP_CLIENT_HOME", filepath.Join("dist"))
+	if got := loadSettings(); !got.BufferedPaint {
+		t.Fatal("dist settings with no migration marker must load as double buffered")
+	}
+}
+
 func TestSettingsLegacyMigration(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("WARP_CLIENT_HOME", dir)

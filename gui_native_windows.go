@@ -99,13 +99,18 @@ type natModel struct {
 	// elapsed seconds, which is what tells a user "it is still working" even
 	// between animation frames.
 	connectAt time.Time
-	working   bool // true while a connect/disconnect goroutine is in flight
-	connected bool
-	status    clientState
-	latency   int64 // live delay ms: through the tunnel, or direct when idle
-	samples   []int64
-	upRates   []int64 // live throughput samples, bytes/sec (upload)
-	downRates []int64 // live throughput samples, bytes/sec (download)
+	// connectStage / connectAttempt give the home page a translatable phase
+	// and a "3/6" combination badge without parsing the log stream.
+	connectStage    string
+	connectAttempt  int
+	connectAttempts int
+	working         bool // true while a connect/disconnect goroutine is in flight
+	connected       bool
+	status          clientState
+	latency         int64 // live delay ms: through the tunnel, or direct when idle
+	samples         []int64
+	upRates         []int64 // live throughput samples, bytes/sec (upload)
+	downRates       []int64 // live throughput samples, bytes/sec (download)
 
 	// The machine's own coordinates, shown on the home tiles while no tunnel
 	// is up: the LAN address, and the public IP's country/city.
@@ -271,6 +276,14 @@ type natUI struct {
 	// something rather than being swallowed.
 	connectCancel context.CancelFunc
 
+	// logPipe is the single consumer of log records. Producers (including the
+	// core's stdout scanner) enqueue without ever touching the GUI thread.
+	logPipe *logPipeline
+
+	// progress is the lock-free worker→GUI channel for the phase badge. The
+	// worker stores atomics; paint reads them on the GUI thread.
+	progress atomicProgress
+
 	// stateEpoch invalidates a status-loop tick that loaded state before a
 	// connect/disconnect/repair finished. Without it, an idle tick that was
 	// already probing the local network when a connect completed applied the
@@ -434,7 +447,14 @@ func runNativeGUI(ctx context.Context, _ options) error {
 		mw.Dispose()
 		return err
 	}
-	cw.SetPaintMode(walk.PaintBuffered)
+	// Double buffering is the default: the whole window is repainted every
+	// frame, so PaintNormal visibly flickers. buffered_paint:false is the
+	// documented escape hatch; R006's watchdog still rescues a stalled buffer.
+	if u.m.set.BufferedPaint {
+		cw.SetPaintMode(walk.PaintBuffered)
+	} else {
+		cw.SetPaintMode(walk.PaintNormal)
+	}
 	cw.SetBoundsPixels(mw.ClientBoundsPixels())
 	u.cw = cw
 
@@ -451,6 +471,9 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	}
 
 	u.ctx, u.cancel = context.WithCancel(ctx)
+	// One consumer owns the log panel from here on. Anything logged before the
+	// window existed is already in u.m.logs and stays there.
+	u.logPipe = startLogPipeline(u)
 
 	mw.SizeChanged().Attach(func() {
 		b := mw.ClientBoundsPixels()
@@ -464,6 +487,7 @@ func runNativeGUI(ctx context.Context, _ options) error {
 
 	go u.statusLoop()
 	go u.spinLoop()
+	u.startDiagnostics()     // GUI heartbeat + hang watchdog; cheap by default
 	go u.probeCore()         // stats the core, asks it which protocols it can parse
 	u.reloadEndpoints(false) // fast cache read on the (main) GUI goroutine
 	u.refreshVPNGatePool()   // cached country list for the OpenVPN exit selector
@@ -522,9 +546,15 @@ func runNativeGUI(ctx context.Context, _ options) error {
 	_ = mw.Run()
 
 	// Stop the workers before tearing anything down, so no goroutine posts into
-	// a disposed window.
+	// a disposed window. Clearing cw first also makes the log consumer's final
+	// flush apply inline instead of sending a message to a dead window.
+	u.cw = nil
 	if u.cancel != nil {
 		u.cancel()
+	}
+	if u.logPipe != nil {
+		u.logPipe.close()
+		u.logPipe = nil
 	}
 	// The session choices (protocol, TUN, Psiphon, autostart) are part of the
 	// preference file too, so closing the window is the last chance to record
@@ -643,9 +673,20 @@ func (u *natUI) scaleFonts(zoom float64) {
 }
 
 func (u *natUI) sync(f func()) {
-	if u.cw != nil {
-		u.mw.Synchronize(f)
+	if u.cw == nil {
+		return
 	}
+	// walk's Synchronize only appends to a queue and PostMessage-s the GUI
+	// thread; it does not wait. Measure both the enqueue and the actual GUI
+	// callback so R005 can tell a queue problem from a slow GUI callback.
+	label := syncCallSite()
+	started := time.Now()
+	u.mw.Synchronize(func() {
+		cb := time.Now()
+		f()
+		observeGUICallback(u, label, time.Since(cb))
+	})
+	observeSyncPost(time.Since(started))
 }
 
 func (u *natUI) invalidate() {
@@ -756,6 +797,7 @@ func (u *natUI) statusLoop() {
 			return
 		case <-t.C:
 		}
+		markWorkerTick()
 		epoch := u.stateEpoch.Load()
 		st, err := loadState()
 		if err != nil {
@@ -1376,10 +1418,14 @@ func (u *natUI) addLogFull(text string, lv int, core bool) {
 func (u *natUI) addLogStage(text string) { u.appendLog(text, 0, false, true) }
 
 func (u *natUI) appendLog(text string, lv int, core, stage bool) {
-	// The full session log is kept: copy, diagnostics and scrollback must be
-	// able to reach every line, so dropping old entries here silently shortened
-	// exactly the history a failed connect needs.
-	u.m.logs = append(u.m.logs, natLog{at: time.Now(), text: text, lv: lv, core: core, stage: stage})
+	r := logRecord{at: time.Now(), text: text, lv: lv, core: core, stage: stage}
+	if u.logPipe == nil {
+		// Tests and the few startup lines posted before the window runs have no
+		// consumer yet; keep the old direct path for them.
+		u.m.logs = append(u.m.logs, natLog{at: r.at, text: r.text, lv: r.lv, core: r.core, stage: r.stage})
+		return
+	}
+	u.logPipe.enqueue(r)
 }
 
 // logText renders every retained line for the clipboard and diagnostics. The
@@ -1671,6 +1717,8 @@ func (u *natUI) doConnect() {
 	m.connecting = true
 	m.working = true
 	m.cancelling = false
+	uiConnecting.Store(true)
+	u.progress.set(connectProgress{Stage: stageScanning})
 	u.connectAsync()
 }
 
@@ -1681,10 +1729,17 @@ func (u *natUI) connectAsync() {
 	m := u.m
 	u.stateEpoch.Add(1)
 	m.connectAt = time.Now()
-	// The pipeline gets its own context so the button can cancel one attempt
-	// without touching the window's lifetime.
-	ctx, cancel := context.WithCancel(u.ctx)
-	u.connectCancel = cancel
+	// The root context only carries cancellation. Each attempt round gets its
+	// own deadline from runConnectCmd, so an internal rescan/reconnect starts
+	// a fresh six-combination budget instead of inheriting the last round's
+	// leftovers. The budget also carries a 10-minute absolute task ceiling.
+	openvpnExit := m.openvpn && !protoChained(m.proto)
+	rootCtx, rootCancel := context.WithCancel(u.ctx)
+	budget := &connectBudget{absolute: time.Now().Add(connectAbsoluteLimit)}
+	ctx := withConnectBudget(rootCtx, budget)
+	budget.root = ctx
+	limit := effectiveConnectLimit(openvpnExit, m.set.OpenVPNAttempts)
+	u.connectCancel = rootCancel
 	u.persistSession()
 	o := defaultConnectOptions(m.proto, m.set.CaptureMode == captureTun, m.set.Rescan)
 	// Settings-page knobs ride on top of the session choices: ports, DNS,
@@ -1736,22 +1791,37 @@ func (u *natUI) connectAsync() {
 			default:
 			}
 			lv, msg := parseCoreLine(line)
-			u.sync(func() { u.addLogFull(msg, lv, true) })
+			// Enqueue only: one PostMessage per core line is what made a dead
+			// relay freeze the window. The pipeline batches these at 10 Hz.
+			u.addLogFull(msg, lv, true)
 		}
 	}()
 	go func() {
-		connectStage = u.connectStageHook
-		defer func() { connectStage = nil }()
+		// Hooks are per-attempt: a stale progress callback from a cancelled
+		// connect must never paint over the next one.
+		restore := setConnectHooks(u.connectStageHook, u.connectProgressHook, func(s string) {
+			u.addLog(s, true)
+		})
+		defer restore()
+		markWorkerTick()
 		err := runConnectCmd(ctx, o)
+		markWorkerTick()
 		_ = pw.Close()
-		cancel()
+		rootCancel()
+		canceled := errors.Is(err, context.Canceled)
+		totalTimeout := errors.Is(err, errConnectTotalTimeout)
+		timedOut := errors.Is(err, context.DeadlineExceeded) || totalTimeout
+		_, tried, totalAttempts := u.progress.get()
 		u.sync(func() {
 			u.connectCancel = nil
 			u.stateEpoch.Add(1)
+			uiConnecting.Store(false)
 			u.m.connecting = false
 			u.m.working = false
 			u.m.cancelling = false
 			u.m.connectAt = time.Time{}
+			u.m.connectAttempt, u.m.connectAttempts = 0, 0
+			u.progress.clear()
 			// Reflect the outcome immediately: leaving connected untouched here
 			// let the button flash "connect" between the spinner stopping and
 			// the status loop's next 2s poll picking up the new state.
@@ -1762,25 +1832,41 @@ func (u *natUI) connectAsync() {
 			if st, lerr := loadState(); lerr == nil {
 				u.m.status = st
 			}
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					u.m.connected = false
-					u.m.spin = 0
+			if canceled || timedOut {
+				u.m.connected = false
+				u.m.spin = 0
+				if timedOut {
+					u.m.connectStage = stageTimeout
+					switch {
+					case totalTimeout:
+						u.addLog(tr("连接总任务超时（10 分钟上限）"), true)
+					case totalAttempts > 0:
+						u.addLog(trf("本轮时间上限，已尝试 %d/%d 组（%d 秒）", tried, totalAttempts, int(limit.Seconds())), true)
+					default:
+						u.addLog(trf("连接超时（%d 秒上限）", int(limit.Seconds())), true)
+					}
+				} else {
+					u.m.connectStage = stageFailed
 					u.addLog(tr("已取消连接"), false)
-					u.invalidate()
-					// The attempt may have started a core before it noticed the
-					// cancellation: reap it and put the host proxy back, or the
-					// next connect finds the mixed port taken.
-					go func() {
-						if dir, derr := coreDir(); derr == nil {
-							core.KillStaleCores(core.CoreInDir(dir))
-						}
-						_ = runDisconnectCmd(context.Background(), options{mixedPort: core.DefaultMixedPort})
-					}()
-					return
 				}
+				u.applyEndpoints(proto)
+				u.invalidate()
+				// The attempt may have started a core before it noticed the
+				// cancellation: reap it and put the host proxy back, or the
+				// next connect finds the mixed port taken.
+				go func() {
+					if dir, derr := coreDir(); derr == nil {
+						core.KillStaleCores(core.CoreInDir(dir))
+					}
+					_ = runDisconnectCmd(context.Background(), options{mixedPort: core.DefaultMixedPort})
+				}()
+				return
+			}
+			if err != nil {
+				u.m.connectStage = stageFailed
 				u.addLog(err.Error(), true)
 			} else {
+				u.m.connectStage = stageSuccess
 				u.addLog("已连接", false)
 				if u.m.openvpn {
 					// The connect refreshed and saved the pool; reload it so the
@@ -1796,10 +1882,19 @@ func (u *natUI) connectAsync() {
 }
 
 func (u *natUI) connectStageHook(s string) {
-	u.sync(func() {
-		u.addLogStage(s)
+	// The stage text goes through the same bounded queue as core logs. The
+	// typed progress hook owns the repaint, so this callback stays cheap.
+	u.addLogStage(s)
+}
+
+// connectProgressHook publishes progress without ever queuing work onto the
+// GUI thread. walk's Synchronize is asynchronous in this version, but an
+// atomic store + one Invalidate cannot grow the queue or wait on the window
+// at all, so a busy GUI can never stall the connect worker.
+func (u *natUI) connectProgressHook(p connectProgress) {
+	if u.progress.set(p) {
 		u.invalidate()
-	})
+	}
 }
 
 // cancelConnect aborts an attempt that is still in flight. The pipeline notices
@@ -2102,20 +2197,17 @@ func (u *natUI) onWheel(x, y int, b walk.MouseButton) {
 // Painting
 // ---------------------------------------------------------------------------
 
-// paintPanics counts recovered paint panics: a broken frame must not flood the
-// log at sixteen repaints a second.
-var paintPanics int
-
 func (u *natUI) paint(c *walk.Canvas, _ walk.Rectangle) (err error) {
+	// The watchdog uses this timestamp to tell "GUI thread is alive but not
+	// painting" from "message loop itself has stopped".
+	guiPaintHeartbeat.Store(time.Now().UnixNano())
+	paintStallStreak.Store(0)
 	// A paint bug used to end the process: the panic unwinds through walk's
 	// window procedure, and a windowsgui binary simply disappears with the log
 	// saying nothing. One frame is not worth losing the session over.
 	defer func() {
 		if rec := recover(); rec != nil {
-			paintPanics++
-			if paintPanics <= 3 {
-				u.appendLog(fmt.Sprintf("界面绘制异常（已跳过该帧）: %v", rec), 2, false, false)
-			}
+			recordPaintPanic(u, rec)
 			err = nil
 		}
 	}()

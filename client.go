@@ -230,6 +230,11 @@ type cachedEndpoint struct {
 	Loss      float32 `json:"loss"`
 	Speed     float64 `json:"speed_mbps"`
 	Working   bool    `json:"working"`
+	// FailCount / QuarantinedUntil are connect-time health: a relay failure
+	// does not make an endpoint dead, but repeated handshake failures should
+	// demote it (and briefly park it) so the next click does not pick it first.
+	FailCount        int       `json:"fail_count,omitempty"`
+	QuarantinedUntil time.Time `json:"quarantined_until,omitempty"`
 }
 
 type cachedScan struct {
@@ -849,10 +854,24 @@ const probeBudget = 9 * time.Second
 // browser that cannot load a page. Returning without an error means at least
 // one source answered 2xx through the tunnel.
 func fetchExitProbe(mixedPort int) (clientState, error) {
+	return fetchExitProbeWithBudget(mixedPort, probeTimeout, probeBudget)
+}
+
+// fetchExitProbeWithBudget is the same probe with caller-supplied per-source
+// timeout and total budget. The health guard uses a longer variant to
+// reconfirm a slow exit before it declares the session dead; the source list
+// and the "any 2xx proves the tunnel" rule are deliberately shared.
+func fetchExitProbeWithBudget(mixedPort int, timeout, budget time.Duration) (clientState, error) {
+	if timeout <= 0 {
+		timeout = probeTimeout
+	}
+	if budget <= 0 {
+		budget = probeBudget
+	}
 	var out clientState
 	proxyURL := "http://127.0.0.1:" + strconv.Itoa(mixedPort)
 	client := &http.Client{
-		Timeout: probeTimeout,
+		Timeout: timeout,
 		Transport: &http.Transport{
 			Proxy: http.ProxyURL(mustParseURL(proxyURL)),
 		},
@@ -864,11 +883,11 @@ func fetchExitProbe(mixedPort int) (clientState, error) {
 	)
 	started := time.Now()
 	for _, u := range dataPlaneSources {
-		if time.Since(started) > probeBudget {
+		if time.Since(started) > budget {
 			// Out of budget: whatever else the sources might have said, the
 			// answer a user waiting for the internet can use is already no.
 			if lastErr == nil && lastCode == 0 {
-				lastErr = fmt.Errorf("probe via tunnel: no source answered within %s", probeBudget)
+				lastErr = fmt.Errorf("probe via tunnel: no source answered within %s", budget)
 			}
 			break
 		}
@@ -980,8 +999,18 @@ func probeDNSTunnel(mixedPort int) error {
 // from a v6-only literal address through the proxy: no DNS involved, so the
 // round-trip exercises exactly the v6 data path.
 func fetchV6Probe(mixedPort int) (string, error) {
+	return fetchV6ProbeWithBudget(mixedPort, 6*time.Second)
+}
+
+// fetchV6ProbeWithBudget keeps the v6 path available to the health guard's
+// longer reconfirmation; a v6-only session must never be reconfirmed over the
+// hostname sources its tunnel intentionally cannot reach.
+func fetchV6ProbeWithBudget(mixedPort int, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = 6 * time.Second
+	}
 	client := &http.Client{
-		Timeout: 6 * time.Second,
+		Timeout: timeout,
 		Transport: &http.Transport{
 			Proxy: http.ProxyURL(mustParseURL("http://127.0.0.1:" + strconv.Itoa(mixedPort))),
 		},
@@ -1010,14 +1039,18 @@ func fetchV6Probe(mixedPort int) (string, error) {
 // fetchSessionProbe probes a live session with a source its tunnel can reach:
 // v6-only sessions use the v6 literal, everything else the hostname sources.
 func fetchSessionProbe(mixedPort int, family string) (clientState, error) {
+	return fetchSessionProbeWithBudget(mixedPort, family, probeTimeout, probeBudget)
+}
+
+func fetchSessionProbeWithBudget(mixedPort int, family string, timeout, budget time.Duration) (clientState, error) {
 	if family == famV6 {
-		ip, err := fetchV6Probe(mixedPort)
+		ip, err := fetchV6ProbeWithBudget(mixedPort, timeout)
 		if err != nil {
 			return clientState{}, err
 		}
 		return clientState{ExitIP: ip}, nil
 	}
-	return fetchExitProbe(mixedPort)
+	return fetchExitProbeWithBudget(mixedPort, timeout, budget)
 }
 
 // verifyTunnel is the data-plane gate between "the core process is listening"

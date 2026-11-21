@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xhwarp/warp-client/internal/cache"
@@ -22,11 +23,69 @@ import (
 // connectStage, when set by the native GUI, receives human-readable progress
 // lines at each step of the connect pipeline. The CLI path never sets it, so
 // its behaviour is unchanged.
-var connectStage func(string)
+var (
+	connectStageMu      sync.RWMutex
+	connectStage        func(string)
+	connectProgressHook func(connectProgress)
+	connectErrorHook    func(string)
+)
+
+// connectProgress is the typed progress the home page needs: a stage key that
+// can be translated, plus the current combination for the "3/6" badge. The
+// human-readable stageMsg stream stays for the logs page.
+type connectProgress struct {
+	Stage   string
+	Attempt int
+	Total   int
+}
+
+// Stage keys are intentionally short: the GUI translates them, so progress
+// text follows the language switch without parsing log messages.
+const (
+	stageScanning  = "scan"
+	stageHandshake = "handshake"
+	stageVerify    = "verify"
+	stageSuccess   = "success"
+	stageFailed    = "failed"
+	stageTimeout   = "timeout"
+)
+
+func setConnectHooks(stage func(string), progress func(connectProgress), errLog func(string)) func() {
+	connectStageMu.Lock()
+	oldStage, oldProgress, oldError := connectStage, connectProgressHook, connectErrorHook
+	connectStage, connectProgressHook, connectErrorHook = stage, progress, errLog
+	connectStageMu.Unlock()
+	return func() {
+		connectStageMu.Lock()
+		connectStage, connectProgressHook, connectErrorHook = oldStage, oldProgress, oldError
+		connectStageMu.Unlock()
+	}
+}
 
 func stageMsg(s string) {
-	if connectStage != nil {
-		connectStage(s)
+	connectStageMu.RLock()
+	fn := connectStage
+	connectStageMu.RUnlock()
+	if fn != nil {
+		fn(s)
+	}
+}
+
+func reportProgress(p connectProgress) {
+	connectStageMu.RLock()
+	fn := connectProgressHook
+	connectStageMu.RUnlock()
+	if fn != nil {
+		fn(p)
+	}
+}
+
+func reportConnectError(s string) {
+	connectStageMu.RLock()
+	fn := connectErrorHook
+	connectStageMu.RUnlock()
+	if fn != nil {
+		fn(s)
 	}
 }
 
@@ -56,6 +115,10 @@ const (
 	// attempts give the failover chain room without turning one connect into a
 	// multi-minute walk through dead nodes.
 	openvpnMaxAttempts = 6
+	// observedOpenVPNHandshakeBaseline is the real-world handshake time from
+	// the successful 08:57 log (17th probe, 17s). The warm-up window must stay
+	// clearly above it — an exactly-17s window fails on the first jitter.
+	observedOpenVPNHandshakeBaseline = 17 * time.Second
 	// openvpnWarmupWindow is how long one relay gets to complete its OpenVPN
 	// handshake. mihomo detaches the handshake from the inbound dial (see
 	// openvpnHandshakeTimeout), so the first client request necessarily fails;
@@ -81,7 +144,102 @@ const (
 	// class was passing while delivering ~14 KB/s.
 	openvpnMinBps       = 150 * 1024
 	openvpnSpeedRetries = 2
+	// openvpnAttemptBudget bounds one base-endpoint × relay combination. It
+	// covers the 22s warm-up window, the 12s verification transfer and core
+	// readiness. A dead combination still ends well before the whole budget.
+	openvpnAttemptBudget = 40 * time.Second
+	// connectHardLimit is the floor for the GUI's end-to-end ceiling. With
+	// OpenVPN the ceiling grows with the configured attempt count so "6 tries"
+	// really means six tries; see effectiveConnectLimit.
+	connectHardLimit = 90 * time.Second
+	// connectLimitSlack absorbs one core start and the inter-combination
+	// backoff when sizing the deadline for a full attempt chain.
+	connectLimitSlack = 8 * time.Second
+	// connectAbsoluteLimit caps the whole connect task across all internal
+	// rescan/reconnect rounds. A single round gets effectiveConnectLimit; the
+	// task as a whole never exceeds this.
+	connectAbsoluteLimit = 10 * time.Minute
+	// connectRetryBackoff spaces two combinations; the longer variant is used
+	// after a TUN adapter conflict so wintun can release its device.
+	connectRetryBackoff = 300 * time.Millisecond
+	tunRetryBackoff     = 1200 * time.Millisecond
 )
+
+// effectiveConnectLimit sizes the GUI deadline. A plain connect keeps the
+// original 90s ceiling. An OpenVPN connect needs one warm-up + verification
+// window per configured combination, so the ceiling grows with the attempt
+// count: a configured six attempts must not silently become four.
+func effectiveConnectLimit(openvpn bool, attempts int) time.Duration {
+	limit := connectHardLimit
+	if !openvpn || attempts <= 0 {
+		return limit
+	}
+	need := time.Duration(attempts)*openvpnAttemptBudget + connectLimitSlack
+	if need > limit {
+		return need
+	}
+	return limit
+}
+
+type connectBudgetKey struct{}
+
+// connectBudget carries the root context and the absolute task deadline. Each
+// round derives a fresh timeout from root, never from the previous round's
+// context, so an internal rescan gets a full attempt budget again.
+type connectBudget struct {
+	root     context.Context
+	absolute time.Time
+}
+
+var errConnectTotalTimeout = errors.New("连接总任务超时（10 分钟上限）")
+
+func withConnectBudget(ctx context.Context, b *connectBudget) context.Context {
+	return context.WithValue(ctx, connectBudgetKey{}, b)
+}
+
+func connectBudgetFrom(ctx context.Context) *connectBudget {
+	b, _ := ctx.Value(connectBudgetKey{}).(*connectBudget)
+	return b
+}
+
+// nextRoundContext builds the deadline for one attempt round. It returns the
+// absolute-task sentinel when even a single combination no longer fits.
+func nextRoundContext(ctx context.Context, opts options) (context.Context, context.CancelFunc, error) {
+	b := connectBudgetFrom(ctx)
+	if b == nil {
+		b = &connectBudget{absolute: time.Now().Add(connectAbsoluteLimit)}
+		// root must carry the budget value, otherwise a round context derived
+		// from it cannot find the budget again on an internal reconnect.
+		ctx = withConnectBudget(ctx, b)
+		b.root = ctx
+	}
+	remaining := time.Until(b.absolute)
+	if remaining < openvpnAttemptBudget {
+		return nil, nil, errConnectTotalTimeout
+	}
+	limit := effectiveConnectLimit(opts.openvpnMode, opts.openvpnAttempts)
+	if remaining < limit {
+		limit = remaining
+	}
+	roundCtx, cancel := context.WithTimeout(b.root, limit)
+	return roundCtx, cancel, nil
+}
+
+// reconnectContext returns the root context an internal retry must use, so
+// the next round does not inherit the current round's shrinking deadline.
+func reconnectContext(ctx context.Context) context.Context {
+	if b := connectBudgetFrom(ctx); b != nil {
+		return b.root
+	}
+	return ctx
+}
+
+// budgetForNextAttempt reports whether one full combination still fits in the
+// remaining deadline. A context without a deadline always has room.
+func budgetForNextAttempt(ctx context.Context) bool {
+	dl, ok := ctx.Deadline()
+	return !ok || time.Until(dl) >= openvpnAttemptBudget
+}
 
 // slowRelayError marks a relay that passed every data-plane check but measured
 // below the usable-speed floor. The connect loop rotates past it without
@@ -109,13 +267,24 @@ func proxyHelperAllowed() bool {
 // The system proxy is only touched AFTER the data plane is verified, so the
 // host is never pointed at a tunnel that does not pass traffic.
 func runConnectCmd(ctx context.Context, opts options) error {
-	err := runConnectInner(ctx, opts)
+	roundCtx, cancel, berr := nextRoundContext(ctx, opts)
+	if berr != nil {
+		return berr
+	}
+	defer cancel()
+	err := runConnectInner(roundCtx, opts)
 	// The steps below report their own errors, and a step that dies because the
 	// context was cancelled usually wraps that into "registration failed: ...".
 	// The caller has to tell "the user cancelled" from "this failed", so the
 	// cancellation wins whenever it is the real reason.
-	if err != nil && ctx.Err() != nil {
-		return ctx.Err()
+	if errors.Is(err, errConnectTotalTimeout) {
+		return err
+	}
+	if b := connectBudgetFrom(ctx); b != nil && !time.Now().Before(b.absolute) {
+		return errConnectTotalTimeout
+	}
+	if err != nil && roundCtx.Err() != nil {
+		return roundCtx.Err()
 	}
 	return err
 }
@@ -168,6 +337,7 @@ func runConnectInner(ctx context.Context, opts options) error {
 	// as one tunnel instead of two.
 	chainUserProto = userProto
 	label := protoLabel(userProto)
+	reportProgress(connectProgress{Stage: stageScanning})
 	stageMsg(fmt.Sprintf("[%s] 开始连接…", label))
 	// The user is waiting on this connect and needs one endpoint, so stop the
 	// scan once a few are verified (the ranking still has room to pick a good
@@ -307,11 +477,12 @@ func runConnectInner(ctx context.Context, opts options) error {
 			if !opts.scanNow {
 				stageMsg(fmt.Sprintf("[%s] 缓存中无可用端点，重新扫描…", label))
 				opts.scanNow = true
-				return runConnectCmd(ctx, opts)
+				return runConnectCmd(reconnectContext(ctx), opts)
 			}
 			return fmt.Errorf("no working endpoint found")
 		}
 	}
+	reportProgress(connectProgress{Stage: stageHandshake, Attempt: 1, Total: len(cands)})
 	stageMsg(fmt.Sprintf("[%s] 可用端点 %d 个，首选 %s (%s %s)",
 		label, len(cands), cands[0].Endpoint, cands[0].Country, cands[0].Colo))
 	fmt.Fprintln(os.Stderr, errPal.ok(fmt.Sprintf("best endpoint: %s (%s) → %s %s",
@@ -446,7 +617,7 @@ func runConnectInner(ctx context.Context, opts options) error {
 			opts.outerAutoPicked = false
 			stageMsg(fmt.Sprintf("[%s] 外层端点一并重选…", label))
 		}
-		return runConnectCmd(ctx, opts)
+		return runConnectCmd(reconnectContext(ctx), opts)
 	}
 
 	// Reflect reality in state.json: the stale core was reaped at the top, so
@@ -650,6 +821,7 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 	opts.openvpnSpeedGate = true
 
 	label := protoLabel(opts.proto) + "+OpenVPN"
+	reportProgress(connectProgress{Stage: stageScanning})
 	stageMsg(fmt.Sprintf("[%s] 开始连接：先起基础协议，再经 VPN Gate 节点出站…", label))
 
 	if err := ensureAccount(ctx, opts); err != nil {
@@ -673,18 +845,30 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 				cands = append(cands, ce)
 			}
 		}
-		if len(cands) > connectMaxAttempts {
-			cands = cands[:connectMaxAttempts]
+		baseCap := connectMaxAttempts
+		if opts.openvpnAttempts > baseCap {
+			baseCap = opts.openvpnAttempts
+		}
+		if len(cands) > baseCap {
+			cands = cands[:baseCap]
 		}
 		if len(cands) == 0 {
 			if !opts.scanNow {
 				stageMsg(fmt.Sprintf("[%s] 无可用基础端点，重新扫描…", label))
 				opts.scanNow = true
-				return runConnectOpenVPN(ctx, opts)
+				return runConnectCmd(reconnectContext(ctx), opts)
 			}
 			return fmt.Errorf("no working endpoint found")
 		}
 	}
+	// Healthy endpoints first: an endpoint that just failed a handshake is
+	// demoted (or briefly isolated) instead of being picked again immediately.
+	cands = rankHealthyEndpoints(cands)
+	maxAttempts := opts.openvpnAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = openvpnMaxAttempts
+	}
+	reportProgress(connectProgress{Stage: stageHandshake, Total: maxAttempts})
 	stageMsg(fmt.Sprintf("[%s] 基础端点 %d 个可用", label, len(cands)))
 
 	cDir, err := coreDir()
@@ -747,14 +931,15 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 		stageMsg(fmt.Sprintf("[%s] 中继速度记忆：%d 个有实测记录，排序已按实测速度优先", label, measured))
 	}
 	stageMsg(fmt.Sprintf("[%s] 出口候选：%d 个基础端点 × %d 个 VPN Gate 节点（最多尝试 %d 组）",
-		label, len(cands), len(relays), min(openvpnMaxAttempts, len(cands)*len(relays))))
+		label, len(cands), len(relays), min(maxAttempts, len(cands)*len(relays))))
 
 	var lastErr error
 	tried := 0
 	slowRejects := 0
+	total := min(maxAttempts, len(cands)*len(relays))
 	for _, ce := range cands {
 		for i := range relays {
-			if tried >= openvpnMaxAttempts {
+			if tried >= maxAttempts || tried >= len(cands)*len(relays) {
 				break
 			}
 			// A cancelled attempt must stop the retry loop here: without this
@@ -763,34 +948,42 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			// A hard deadline may still arrive mid-chain (a slow scan ate the
+			// budget). Leave a clear message instead of cutting off silently
+			// after N of the configured combinations.
+			if !budgetForNextAttempt(ctx) {
+				msg := fmt.Sprintf("本轮时间上限，已尝试 %d/%d 组", tried, total)
+				stageMsg(fmt.Sprintf("[%s] %s", label, msg))
+				return fmt.Errorf("%s", msg)
+			}
 			tried++
 			node := relays[i]
 			opts.openvpnNode = &node
+			reportProgress(connectProgress{Stage: stageHandshake, Attempt: tried, Total: total})
 			stageMsg(fmt.Sprintf("[%s] 基础端点 %s + 出口节点 %s（%s，组合 %d/%d）…",
-				label, ce.Endpoint, node.id(), node.CountryShort, tried, min(openvpnMaxAttempts, len(cands)*len(relays))))
-			state, serr := startAndVerify(ctx, opts, ce, run, bin, cDir, label, nil)
-			if serr != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				var slow *slowRelayError
-				if errors.As(serr, &slow) {
-					// The relay works; only its throughput is unusable. Keep it
-					// out of the failure memory — the speed memory already ranks
-					// it behind everything else — and spend the next attempt on a
-					// different relay.
-					lastErr = serr
-					slowRejects++
-					stageMsg(fmt.Sprintf("[%s] 出口速度过慢（≈%d KB/s），换下一个中继…", label, slow.bps/1024))
-					if slowRejects >= openvpnSpeedRetries {
-						opts.openvpnAcceptSlow = true
-						stageMsg(fmt.Sprintf("[%s] 已连续 %d 个中继偏慢，后续优先保持连接、不再因速度换节点", label, slowRejects))
-					}
+				label, ce.Endpoint, node.id(), node.CountryShort, tried, total))
+			if opts.tunMode {
+				if werr := core.WaitTUNReleased(tunRetryBackoff); werr != nil {
+					reportConnectError(fmt.Sprintf("[%s] TUN 适配器在 %s 内未释放，跳过组合 %d/%d: %v",
+						label, tunRetryBackoff, tried, total, werr))
 					continue
 				}
 			}
+			// One bad combination must not consume the whole 90s budget. The
+			// parent context still cancels instantly when the user clicks.
+			attemptCtx, cancelAttempt := context.WithTimeout(ctx, openvpnAttemptBudget)
+			state, serr := startAndVerify(attemptCtx, opts, ce, run, bin, cDir, label, nil)
+			attemptTimedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
+			cancelAttempt()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if attemptTimedOut && serr != nil {
+				serr = fmt.Errorf("组合超时（%s，已跳过）: %w", openvpnAttemptBudget, serr)
+			}
 			if serr == nil {
 				clearVPNGateFailure(node.id())
+				clearEndpointHandshakeFailure(opts, ce)
 				rememberLastGoodVPNGate(node)
 				if err := saveState(state); err != nil {
 					fmt.Fprintln(os.Stderr, errPal.warn("state not persisted: "+err.Error()))
@@ -814,29 +1007,57 @@ func runConnectOpenVPN(ctx context.Context, opts options) error {
 			}
 			lastErr = serr
 			fmt.Fprintln(os.Stderr, errPal.warn(fmt.Sprintf("组合 %s + %s: %v", ce.Endpoint, node.id(), serr)))
-			// Deliberately NOT markEndpointDead: a relay failure says nothing
-			// about the WARP underlay, and evicting a healthy endpoint here would
-			// poison the scan cache for every later session.
-			if serr != nil && strings.Contains(serr.Error(), "base endpoint") {
+			markEndpointHandshakeFailed(opts, ce)
+			var slow *slowRelayError
+			if errors.As(serr, &slow) {
+				// The relay works; only its throughput is unusable. Keep it
+				// out of the failure memory — the speed memory already ranks
+				// it behind everything else — and spend the next attempt on a
+				// different relay.
+				slowRejects++
+				stageMsg(fmt.Sprintf("[%s] 出口速度过慢（≈%d KB/s），换下一个中继…", label, slow.bps/1024))
+				if slowRejects >= openvpnSpeedRetries {
+					opts.openvpnAcceptSlow = true
+					stageMsg(fmt.Sprintf("[%s] 已连续 %d 个中继偏慢，后续优先保持连接、不再因速度换节点", label, slowRejects))
+				}
+			} else {
+				// The relay itself failed; the phone client's 10-minute memory
+				// keeps the next attempt off this node.
+				markVPNGateFailed(node.id())
+			}
+			if strings.Contains(serr.Error(), "base endpoint") {
 				// A dead underlay fails every relay; move on to the next base
 				// instead of burning the remaining combinations on it.
 				break
 			}
-			// The relay itself failed; the phone client's 10-minute memory keeps
-			// the next attempt (or the automatic retry scan) off this node.
-			markVPNGateFailed(node.id())
+			// Back off before the next core start. A TUN attempt needs longer:
+			// wintun releases its adapter asynchronously after the core exits.
+			delay := connectRetryBackoff
+			if opts.tunMode {
+				delay = tunRetryBackoff
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
 		}
-		if tried >= openvpnMaxAttempts {
+		if tried >= maxAttempts || tried >= len(cands)*len(relays) {
 			break
 		}
 	}
 	// Every combination failed: the snapshot may be stale on both axes. One
-	// fresh scan and a forced VPN Gate refetch, then report honestly.
-	if opts.pick == "" && !opts.scanNow {
+	// fresh scan and a forced VPN Gate refetch, then report honestly. A hard
+	// deadline (or a cancel) must never be turned into another full retry.
+	if opts.pick == "" && !opts.scanNow && ctx.Err() == nil {
 		stageMsg(fmt.Sprintf("[%s] 全部组合失败，重新扫描基础端点并刷新 VPN Gate 节点…", label))
 		opts.scanNow = true
-		return runConnectOpenVPN(ctx, opts)
+		return runConnectCmd(reconnectContext(ctx), opts)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	reportProgress(connectProgress{Stage: stageFailed, Attempt: tried, Total: total})
 	return fmt.Errorf("connect failed: OpenVPN 出口在 %d 个组合上均未通过验证: %w", tried, lastErr)
 }
 
@@ -1136,6 +1357,96 @@ func socks5Dial(ctx context.Context, socksPort int, addr string, timeout time.Du
 // data plane is verified: the Psiphon exit uses it to bring its sidecar up (and
 // wait for a real tunnel) so the verification below already exercises the final
 // egress. Every non-Psiphon caller passes nil and the flow is unchanged.
+
+// openVPNWarmupDeps is the seam the regression tests drive. Production fills
+// it with the real warm-up, log watcher, verifier and core Stop; tests swap in
+// fakes so the select can be proven to exit on success and on cancellation
+// without a live mihomo process.
+type openVPNWarmupDeps struct {
+	warm     func(context.Context, int, string) error
+	watch    func(context.Context, int) (<-chan string, func())
+	verify   func(options, func(string)) (clientState, error)
+	stopCore func() error
+	stage    func(string)
+}
+
+func defaultOpenVPNWarmupDeps(c *core.Core) openVPNWarmupDeps {
+	return openVPNWarmupDeps{
+		warm:     warmupOpenVPN,
+		watch:    watchOpenVPNLogs,
+		verify:   verifyTunnel,
+		stopCore: c.Stop,
+		stage:    func(s string) { stageMsg(s) },
+	}
+}
+
+// warmupAndVerifyOpenVPN owns the one place where an OpenVPN session can get
+// stuck: the race between the warm-up result, a fatal core log and the caller's
+// context. Every exit path releases the watcher, the warm-up context and the
+// log-suppression flag, and successful warm-up always falls through to the
+// data-plane verification.
+func warmupAndVerifyOpenVPN(ctx context.Context, opts options, label string, deps openVPNWarmupDeps) (clientState, error) {
+	if deps.warm == nil || deps.watch == nil || deps.verify == nil {
+		return clientState{}, fmt.Errorf("OpenVPN warm-up: missing dependencies")
+	}
+	stage := deps.stage
+	if stage == nil {
+		stage = func(string) {}
+	}
+	stage(fmt.Sprintf("[%s] 预热 OpenVPN 中继（握手窗口 %s）…", label, openvpnWarmupWindow))
+	warmCtx, cancelWarm := context.WithCancel(ctx)
+	fatalCh, stopWatch := deps.watch(warmCtx, opts.apiPort)
+	// Buffered so the producer never blocks when the select has already
+	// returned through another branch.
+	warmDone := make(chan error, 1)
+	// Expected dial timeouts during warm-up are counted and reported as one
+	// INFO line by the GUI log pipeline, never as a wall of WARNs.
+	openvpnWarmupActive.Store(true)
+	// The producer is what R001 accidentally dropped: without it only the
+	// fatal-log branch could ever wake this select.
+	go func() { warmDone <- deps.warm(warmCtx, opts.mixedPort, label) }()
+	finish := func() {
+		openvpnWarmupActive.Store(false)
+		stopWatch()
+		cancelWarm()
+	}
+
+	var werr error
+	select {
+	case werr = <-warmDone:
+		finish()
+	case reason := <-fatalCh:
+		finish()
+		if deps.stopCore != nil {
+			_ = deps.stopCore()
+		}
+		return clientState{}, fmt.Errorf("OpenVPN 出口认证被拒绝（%s），立即换节点", reason)
+	case <-ctx.Done():
+		finish()
+		if deps.stopCore != nil {
+			_ = deps.stopCore()
+		}
+		return clientState{}, ctx.Err()
+	}
+	if werr != nil {
+		if deps.stopCore != nil {
+			_ = deps.stopCore()
+		}
+		return clientState{}, werr
+	}
+
+	reportProgress(connectProgress{Stage: stageVerify})
+	stage(fmt.Sprintf("[%s] 隧道就绪，开始数据面验证…", label))
+	probe, perr := deps.verify(opts, func(msg string) { stage(fmt.Sprintf("[%s] %s", label, msg)) })
+	if perr != nil {
+		if deps.stopCore != nil {
+			_ = deps.stopCore()
+		}
+		return clientState{}, fmt.Errorf("数据面验证失败: %w", perr)
+	}
+	return probe, nil
+}
+
 func startAndVerify(ctx context.Context, opts options, ce cachedEndpoint, run protoRun, bin, cDir, label string, afterReady func() error) (clientState, error) {
 	configYAML, err := renderClientConfig(opts, ce, run)
 	if err != nil {
@@ -1180,37 +1491,10 @@ func startAndVerify(ctx context.Context, opts options, ce cachedEndpoint, run pr
 		}
 		return clientState{}, err
 	}
-	stageMsg(fmt.Sprintf("[%s] 隧道就绪，开始数据面验证…", label))
 	if afterReady != nil {
 		if err := afterReady(); err != nil {
 			_ = c.Stop()
 			return clientState{}, err
-		}
-	}
-	// The chained openvpn outbound handshakes lazily on its first dial and
-	// outlives the inbound's 5s dial timeout, so the tunnel is warmed up with
-	// repeated requests before verifyTunnel judges it. A relay that cannot link
-	// within the window is a dead candidate, not a slow one.
-	if opts.openvpnMode {
-		stageMsg(fmt.Sprintf("[%s] 预热 OpenVPN 中继（握手窗口 %s）…", label, openvpnWarmupWindow))
-		warmCtx, cancelWarm := context.WithCancel(ctx)
-		fatalCh, stopWatch := watchOpenVPNLogs(warmCtx, opts.apiPort)
-		warmDone := make(chan error, 1)
-		go func() { warmDone <- warmupOpenVPN(warmCtx, opts.mixedPort, label) }()
-		select {
-		case werr := <-warmDone:
-			stopWatch()
-			if werr != nil {
-				_ = c.Stop()
-				return clientState{}, werr
-			}
-		case reason := <-fatalCh:
-			// AUTH_FAILED is terminal for this relay: retrying the same node
-			// only spends the rest of the window before rotating anyway.
-			cancelWarm()
-			stopWatch()
-			_ = c.Stop()
-			return clientState{}, fmt.Errorf("OpenVPN 出口认证被拒绝（%s），立即换节点", reason)
 		}
 	}
 
@@ -1220,10 +1504,24 @@ func startAndVerify(ctx context.Context, opts options, ce cachedEndpoint, run pr
 	// (HTTPS, DNS via the hostname, optional IPv6, exit IP) prove it. The
 	// system proxy is still untouched here — a failed candidate leaves no
 	// host mutation to undo.
-	probe, perr := verifyTunnel(opts, func(msg string) { stageMsg(fmt.Sprintf("[%s] %s", label, msg)) })
-	if perr != nil {
-		_ = c.Stop()
-		return clientState{}, fmt.Errorf("数据面验证失败: %w", perr)
+	var probe clientState
+	if opts.openvpnMode {
+		// The chained outbound handshakes lazily and outlives the inbound's
+		// 5s dial timeout, so warm it up before judging the data plane.
+		var werr error
+		probe, werr = warmupAndVerifyOpenVPN(ctx, opts, label, defaultOpenVPNWarmupDeps(c))
+		if werr != nil {
+			return clientState{}, werr
+		}
+	} else {
+		reportProgress(connectProgress{Stage: stageVerify})
+		stageMsg(fmt.Sprintf("[%s] 隧道就绪，开始数据面验证…", label))
+		var perr error
+		probe, perr = verifyTunnel(opts, func(msg string) { stageMsg(fmt.Sprintf("[%s] %s", label, msg)) })
+		if perr != nil {
+			_ = c.Stop()
+			return clientState{}, fmt.Errorf("数据面验证失败: %w", perr)
+		}
 	}
 
 	// A relay that passed every data-plane check can still be unusable: the
@@ -1350,6 +1648,7 @@ func startAndVerify(ctx context.Context, opts options, ce cachedEndpoint, run pr
 			state.ProxySnap = raw
 		}
 	}
+	reportProgress(connectProgress{Stage: stageSuccess})
 	return state, nil
 }
 

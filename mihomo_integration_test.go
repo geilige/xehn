@@ -109,7 +109,10 @@ func TestMihomoAcceptsRenderedConfig(t *testing.T) {
 			if outer != nil {
 				wantName += mihomoChainSuffix
 			}
-			proxies, err := controllerProxies(api)
+			// WaitReady only proves /version answers; the controller can still
+			// be registering proxies for a moment afterwards. Wait for the
+			// name instead of asserting against the first snapshot.
+			proxies, err := controllerProxiesWait(api, wantName, testProxyWait)
 			if err != nil {
 				t.Fatalf("controller /proxies: %v", err)
 			}
@@ -118,11 +121,9 @@ func TestMihomoAcceptsRenderedConfig(t *testing.T) {
 			}
 
 			// The mixed-port must be listening.
-			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", mixed), 3*time.Second)
-			if err != nil {
+			if err := waitMixedPort(mixed, testPortWait); err != nil {
 				t.Fatalf("mixed-port not listening: %v", err)
 			}
-			conn.Close()
 		})
 	}
 
@@ -197,7 +198,7 @@ func TestMihomoAcceptsRenderedConfig(t *testing.T) {
 		if outer != nil {
 			wantName += mihomoChainSuffix
 		}
-		proxies, err := controllerProxies(api)
+		proxies, err := controllerProxiesWait(api, wantName, testProxyWait)
 		if err != nil {
 			t.Fatalf("controller /proxies: %v", err)
 		}
@@ -206,11 +207,9 @@ func TestMihomoAcceptsRenderedConfig(t *testing.T) {
 		}
 
 		// The mixed-port must be listening.
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", mixed), 3*time.Second)
-		if err != nil {
+		if err := waitMixedPort(mixed, testPortWait); err != nil {
 			t.Fatalf("mixed-port not listening: %v", err)
 		}
-		conn.Close()
 	})
 }
 
@@ -281,6 +280,78 @@ func freePort(t *testing.T) int {
 	}
 	defer ln.Close()
 	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// WaitReady only proves the controller's /version endpoint is answering. A
+// loaded machine can answer that before the config's proxies have been
+// registered, so assertions need a bounded wait for the asynchronous state.
+// 10s covers the observed sub-second apply window with a wide margin; 200ms
+// polling keeps the added cost negligible on the happy path (one query).
+const (
+	testProxyWait = 10 * time.Second
+	testPortWait  = 5 * time.Second
+	testReadyPoll = 200 * time.Millisecond
+	testDialProbe = 500 * time.Millisecond
+)
+
+func controllerProxiesWait(apiPort int, wantName string, timeout time.Duration) (map[string]json.RawMessage, error) {
+	deadline := time.Now().Add(timeout)
+	var last map[string]json.RawMessage
+	var lastErr error
+	for {
+		proxies, err := controllerProxies(apiPort)
+		if err == nil {
+			last = proxies
+			if _, ok := proxies[wantName]; ok {
+				return proxies, nil
+			}
+		} else {
+			lastErr = err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr != nil {
+				return nil, fmt.Errorf("proxy %q not registered within %s: last HTTP error: %v (have: %v)",
+					wantName, timeout, lastErr, proxyNames(last))
+			}
+			return nil, fmt.Errorf("proxy %q not registered within %s (have: %v)", wantName, timeout, proxyNames(last))
+		}
+		pause := testReadyPoll
+		if remaining < pause {
+			pause = remaining
+		}
+		time.Sleep(pause)
+	}
+}
+
+// waitMixedPort covers the same async window for the data-plane listener:
+// /version can answer before mihomo has bound mixed-port. A 500ms dial probe
+// avoids turning a slow bind into a 5s single-block test stall.
+func waitMixedPort(port int, timeout time.Duration) error {
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("port %d not listening within %s: %v", port, timeout, lastErr)
+		}
+		dial := testDialProbe
+		if remaining < dial {
+			dial = remaining
+		}
+		conn, err := net.DialTimeout("tcp", addr, dial)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		lastErr = err
+		pause := testReadyPoll
+		if remaining < pause {
+			pause = remaining
+		}
+		time.Sleep(pause)
+	}
 }
 
 func controllerProxies(apiPort int) (map[string]json.RawMessage, error) {

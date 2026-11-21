@@ -432,14 +432,26 @@ var enStrings = map[string]string{
 	"名称、国家、城市或 IP":                      "Name, country, city or IP",
 	"逗号分隔，如 223.5.5.5, 1.1.1.1":         "Comma separated, e.g. 223.5.5.5, 1.1.1.1",
 	"端点，如 188.114.97.198:4500（留空 = 自动）": "Endpoint, e.g. 188.114.97.198:4500 (empty = automatic)",
-	"1-65535": "1-65535",
-	"1-60 秒":  "1-60 s",
-	"0 = 自动":  "0 = auto",
-	"MTU":     "MTU",
-	"DNS":     "DNS",
-	"个":       "",
-	"已选":      "Pinned",
-	"重新探测内核…": "Re-probing the core…",
+	"1-65535":      "1-65535",
+	"1-60 秒":       "1-60 s",
+	"0 = 自动":       "0 = auto",
+	"MTU":          "MTU",
+	"DNS":          "DNS",
+	"个":            "",
+	"已选":           "Pinned",
+	"重新探测内核…":      "Re-probing the core…",
+	"扫描中":          "Scanning",
+	"握手中":          "Handshaking",
+	"验证中":          "Verifying",
+	"连接成功":         "Connected",
+	"连接失败":         "Failed",
+	"连接超时":         "Timed out",
+	"连接超时（90 秒上限）": "Connection timed out (90s limit)",
+	"诊断日志":         "Diagnostics log",
+	"记录心跳与 GUI 阻塞排查信息到 diagnostics.log": "Record heartbeat and GUI stall diagnostics to diagnostics.log",
+	"连接总任务超时（10 分钟上限）":                  "Total connection timeout (10 minute limit)",
+	"复核通过，出口仍可用":                        "Reconfirmation passed, exit is still usable",
+	"复核失败，判定出口失效":                       "Reconfirmation failed, exit considered dead",
 }
 
 // trfKeys holds the parameterised strings. fmt verbs are part of the key, so
@@ -472,6 +484,15 @@ var enFormats = map[string]string{
 	"VPN Gate 节点获取失败：%s":                "VPN Gate fetch failed: %s",
 	"VPN Gate 节点刷新失败：%s（沿用缓存列表）":        "VPN Gate refresh failed: %s (using cached list)",
 	"%d 行日志已复制到剪贴板":                     "%d log lines copied to clipboard",
+	"预热期已抑制 %d 条预期超时":                   "Suppressed %d expected warm-up timeouts",
+	"组合 %d/%d":                          "attempt %d/%d",
+	"%s %ds":                            "%s %ds",
+	"%s · %s":                           "%s · %s",
+	"连接超时（%d 秒上限）":                      "Connection timed out (%ds limit)",
+	"已达时间上限，已尝试 %d/%d 组（%d 秒）":          "Time limit reached, tried %d/%d combinations (%ds)",
+	"GUI 回调耗时过长：%s %s":                  "Slow GUI callback: %s %s",
+	"本轮时间上限，已尝试 %d/%d 组（%d 秒）":          "Round time limit reached, tried %d/%d combinations (%ds)",
+	"连续 %d 次探测失败，进行加长复核（%s）…":           "%d consecutive probe failures, running extended reconfirmation (%s)…",
 }
 
 // tr translates a UI string. Chinese is the source language, so zh needs no
@@ -505,4 +526,24 @@ func (u *natUI) applyLang() {
 		uiLang = langZH
 	}
 	u.invalidate()
+}
+
+// stageText turns the pipeline's stage key into a translated short label.
+// Unknown keys are invisible on the home page instead of showing a raw key.
+func stageText(key string) string {
+	switch key {
+	case stageScanning:
+		return tr("扫描中")
+	case stageHandshake:
+		return tr("握手中")
+	case stageVerify:
+		return tr("验证中")
+	case stageSuccess:
+		return tr("连接成功")
+	case stageFailed:
+		return tr("连接失败")
+	case stageTimeout:
+		return tr("连接超时")
+	}
+	return ""
 }
